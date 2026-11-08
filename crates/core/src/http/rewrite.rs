@@ -55,7 +55,7 @@ pub fn parse_absolute_target(target: &str) -> Option<AbsoluteTarget> {
     })
 }
 
-fn line_name_is(line: &[u8], name: &str) -> bool {
+pub(crate) fn line_name_is(line: &[u8], name: &str) -> bool {
     line.iter()
         .position(|b| *b == b':')
         .is_some_and(|i| line[..i].eq_ignore_ascii_case(name.as_bytes()))

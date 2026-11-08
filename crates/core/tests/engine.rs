@@ -1,24 +1,33 @@
 //! End-to-end behaviour of a whole project: capture, storage, repeater,
 //! fuzzer limits and passive findings.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use sluice_core::browser::BrowserKind;
 use sluice_core::engine::{Engine, EngineError, SendRequest, UiEvent};
 use sluice_core::fuzzer::{AttackMode, FuzzConfig, FuzzError, PayloadSource, RunState};
 use sluice_core::http::{parse_request_head, request_framing, BodyState, MessageReader};
-use sluice_core::intercept::Verdict;
+use sluice_core::intercept::{Direction, Verdict};
+use sluice_core::match_replace::{MatchRule, RuleKind};
 use sluice_core::model::Target;
 use sluice_core::repeater::RepeaterTab;
 use sluice_core::scope::{Scope, ScopeRule};
-use sluice_core::store::FlowFilter;
+use sluice_core::store::{FlowFilter, Store};
 use sluice_core::text::{Encoding, RawText};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
 
 #[derive(Default)]
 struct Stats {
@@ -50,11 +59,18 @@ async fn spawn_origin(delay: Duration) -> (SocketAddr, Arc<Stats>) {
                     stats.active.fetch_sub(1, Ordering::SeqCst);
                     stats.seen.lock().unwrap().push(raw);
                     let body = if parsed.target.contains("hit") { "MATCHME" } else { "nothing" };
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sid=abc\r\nContent-Length: {}\r\n\r\n{body}",
+                    let (coding, body) = if parsed.target.contains("gzip") {
+                        ("Content-Encoding: gzip\r\n", gzip(body.as_bytes()))
+                    } else {
+                        ("", body.as_bytes().to_vec())
+                    };
+                    let mut reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sid=abc\r\n{coding}Content-Length: {}\r\n\r\n",
                         body.len()
-                    );
-                    reader.stream_mut().write_all(reply.as_bytes()).await.unwrap();
+                    )
+                    .into_bytes();
+                    reply.extend(body);
+                    reader.stream_mut().write_all(&reply).await.unwrap();
                 }
             });
         }
@@ -95,6 +111,7 @@ fn fuzz_config(addr: SocketAddr, payloads: &[&str], concurrency: usize, delay_ms
         encoding: Encoding::Utf8,
         mode: AttackMode::Single,
         payloads: vec![PayloadSource::List(payloads.iter().map(|s| s.to_string()).collect())],
+        processing: vec![],
         concurrency,
         delay_ms,
         grep: Some("MATCHME".into()),
@@ -387,4 +404,118 @@ async fn fuzzer_can_pause_and_stop() {
     engine.fuzz_control(run.id, RunState::Stopped).unwrap();
     assert_eq!(wait_finished(&mut rx).await, RunState::Stopped);
     assert!(stats.seen.lock().unwrap().len() < 500);
+}
+
+#[tokio::test]
+async fn fuzzer_matches_inside_compressed_responses_and_history_finds_them() {
+    let (_dir, engine, mut rx) = open();
+    let (addr, _) = spawn_origin(Duration::ZERO).await;
+    allow(&engine, addr);
+    let run = engine.fuzz_start(fuzz_config(addr, &["gzip-hit", "gzip-miss"], 1, 0)).unwrap();
+    assert_eq!(wait_finished(&mut rx).await, RunState::Finished);
+    let results = engine.fuzz_results(run.id).unwrap();
+    assert_eq!(results.iter().map(|r| r.matched).collect::<Vec<_>>(), [true, false]);
+    let search = FlowFilter {
+        text: Some("MATCHME".into()),
+        ..Default::default()
+    };
+    assert_eq!(engine.list_flows(&search).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resuming_sends_only_what_is_missing_and_rechecks_old_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("p.sluice");
+    let (engine, mut rx) = Engine::open(&project, dir.path()).unwrap();
+    let (addr, stats) = spawn_origin(Duration::ZERO).await;
+    allow(&engine, addr);
+    let payloads: Vec<String> = (0..40).map(|i| if i == 0 { "gzip-hit".into() } else { format!("p{i}") }).collect();
+    let refs: Vec<&str> = payloads.iter().map(String::as_str).collect();
+    let run = engine.fuzz_start(fuzz_config(addr, &refs, 1, 10)).unwrap();
+    assert!(matches!(
+        engine.fuzz_resume(run.id),
+        Err(EngineError::Fuzz(FuzzError::NotStopped))
+    ));
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    engine.fuzz_control(run.id, RunState::Stopped).unwrap();
+    assert_eq!(wait_finished(&mut rx).await, RunState::Stopped);
+    let mut earlier = engine.fuzz_results(run.id).unwrap();
+    assert!(!earlier.is_empty() && earlier.len() < 40, "stopped after {}", earlier.len());
+
+    // A result recorded before matching could read compressed bodies.
+    earlier[0].matched = false;
+    let store = Store::open(&project, Arc::new(RwLock::new(Scope::default()))).unwrap();
+    store.save_fuzz_result(&earlier[0]).unwrap();
+    store.flush();
+
+    let sent_before = stats.seen.lock().unwrap().len();
+    assert_eq!(engine.fuzz_resume(run.id).unwrap().state, RunState::Running);
+    assert_eq!(wait_finished(&mut rx).await, RunState::Finished);
+
+    let results = engine.fuzz_results(run.id).unwrap();
+    assert_eq!(results.iter().map(|r| r.index).collect::<HashSet<_>>().len(), 40);
+    assert!(results[0].matched, "old results are matched again");
+    let sent_after = stats.seen.lock().unwrap().len() - sent_before;
+    // The one request in flight at the stop has no result, so it goes again.
+    let missing = 40 - earlier.len();
+    assert!((missing..=missing + 1).contains(&sent_after), "sent {sent_after} for {missing} missing");
+    assert_eq!(engine.list_fuzz_runs().unwrap()[0].state, RunState::Finished);
+    assert!(matches!(
+        engine.fuzz_resume(run.id),
+        Err(EngineError::Fuzz(FuzzError::NotStopped))
+    ));
+}
+
+#[tokio::test]
+async fn runs_left_active_by_a_previous_session_reopen_as_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("p.sluice");
+    let (engine, _rx) = Engine::open(&project, dir.path()).unwrap();
+    let (addr, _) = spawn_origin(Duration::ZERO).await;
+    allow(&engine, addr);
+    let run = engine.fuzz_start(fuzz_config(addr, &["a", "b", "c"], 1, 2000)).unwrap();
+    assert_eq!(engine.list_fuzz_runs().unwrap()[0].state, RunState::Running);
+
+    let (reopened, _rx) = Engine::open(&project, dir.path()).unwrap();
+    assert_eq!(reopened.list_fuzz_runs().unwrap()[0].state, RunState::Stopped);
+    engine.fuzz_control(run.id, RunState::Stopped).unwrap();
+}
+
+#[tokio::test]
+async fn stop_does_not_wait_out_the_delay() {
+    let (_dir, engine, mut rx) = open();
+    let (addr, _) = spawn_origin(Duration::ZERO).await;
+    allow(&engine, addr);
+    let run = engine.fuzz_start(fuzz_config(addr, &["a", "b"], 1, 60_000)).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine.fuzz_control(run.id, RunState::Stopped).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(2), wait_finished(&mut rx)).await;
+    assert_eq!(ended.expect("stop should not wait for the delay"), RunState::Stopped);
+    engine.fuzz_resume(run.id).unwrap();
+    engine.fuzz_control(run.id, RunState::Stopped).unwrap();
+}
+
+#[tokio::test]
+async fn match_rules_persist_with_their_problems_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("p.sluice");
+    let rule = |pattern: &str| MatchRule {
+        enabled: true,
+        direction: Direction::Request,
+        kind: RuleKind::SetHeader,
+        pattern: pattern.into(),
+        replacement: "1".into(),
+        regex: false,
+    };
+    let (engine, _rx) = Engine::open(&project, dir.path()).unwrap();
+    let saved = engine.set_match_rules(vec![rule("X-Good"), rule("not valid")]).unwrap();
+    assert_eq!(saved.errors[0], None);
+    assert!(saved.errors[1].is_some());
+    engine.list_flows(&FlowFilter::default()).unwrap();
+
+    let (reopened, _rx) = Engine::open(&project, dir.path()).unwrap();
+    let loaded = reopened.match_rules();
+    assert_eq!(loaded.rules, [rule("X-Good"), rule("not valid")]);
+    assert!(loaded.errors[1].is_some());
 }

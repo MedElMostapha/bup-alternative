@@ -6,21 +6,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
 use crate::browser::{self, BrowserError, BrowserInfo, BrowserKind};
 use crate::ca::{CaError, CertAuthority};
-use crate::fuzzer::{self, FuzzConfig, FuzzDeps, FuzzError, FuzzResult, FuzzRunInfo, RunState};
-use crate::http::decode::decode_body;
-use crate::http::{find_head_end, parse_response_head};
+use crate::fuzzer::{self, AttackPlan, FuzzConfig, FuzzDeps, FuzzError, FuzzResult, FuzzRunInfo, RunState};
+use crate::http::decode::decode_response;
 use crate::intercept::{Direction, Intercept, Pending, Verdict};
+use crate::match_replace::{MatchRule, RuleSet, RulesView};
 use crate::model::{Flow, IdGen, Source, Target, WsFrame};
 use crate::proxy::{self, Event, ProxyCtx, ProxyHandle, ProxySettings};
 use crate::repeater::{normalize_message, RepeaterTab};
 use crate::scanner::{scan_flow, Finding};
 use crate::scope::Scope;
+use crate::site_map::{self, SiteTree};
 use crate::store::{FlowFilter, FlowSummary, Store, StoreError};
 use crate::text::RawText;
 use crate::upstream::{send_raw, SendOptions};
@@ -30,6 +32,7 @@ const SCAN_QUEUE: usize = 1024;
 const SCOPE_KEY: &str = "scope";
 const SETTINGS_KEY: &str = "proxy_settings";
 const LISTEN_KEY: &str = "listen_addr";
+const RULES_KEY: &str = "match_rules";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +126,7 @@ pub struct Engine {
     ca: Arc<CertAuthority>,
     scope: Arc<RwLock<Scope>>,
     settings: Arc<RwLock<ProxySettings>>,
+    rules: Arc<RwLock<RuleSet>>,
     intercept: Arc<Intercept>,
     ids: Arc<IdGen>,
     ui: mpsc::UnboundedSender<UiEvent>,
@@ -143,12 +147,21 @@ impl Engine {
         let ca = Arc::new(CertAuthority::load_or_create(data_dir)?);
         let scope = Arc::new(RwLock::new(Scope::default()));
         let store = Arc::new(Store::open(project, scope.clone())?);
-        if let Some(saved) = store.get_value(SCOPE_KEY)? {
-            *scope.write().expect("scope lock") = saved;
+        if let Some(saved) = store.get_value::<Scope>(SCOPE_KEY)? {
+            *scope.write().expect("scope lock") = saved.normalized();
         }
         let settings = store.get_value::<ProxySettings>(SETTINGS_KEY)?.unwrap_or_default();
+        let rules = RuleSet::new(store.get_value::<Vec<MatchRule>>(RULES_KEY)?.unwrap_or_default());
         let last_tab = store.list_tabs()?.iter().map(|t| t.id).max().unwrap_or(0);
-        let last_run = store.list_fuzz_runs()?.first().map_or(0, |r| r.id);
+        let runs = store.list_fuzz_runs()?;
+        let last_run = runs.first().map_or(0, |r| r.id);
+        // Nothing is driving these any more, so they can only be resumed.
+        for mut run in runs {
+            if matches!(run.state, RunState::Running | RunState::Paused) {
+                run.state = RunState::Stopped;
+                store.save_fuzz_run(&run)?;
+            }
+        }
         let ids = Arc::new(IdGen::starting_after(store.last_flow_id()?));
         let (ui, ui_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::channel(EVENT_QUEUE);
@@ -160,6 +173,7 @@ impl Engine {
             ca,
             scope: scope.clone(),
             settings: Arc::new(RwLock::new(settings)),
+            rules: Arc::new(RwLock::new(rules)),
             intercept: Arc::new(Intercept::default()),
             ids,
             ui: ui.clone(),
@@ -213,6 +227,7 @@ impl Engine {
             scope: self.scope.clone(),
             intercept: self.intercept.clone(),
             settings: self.settings.clone(),
+            rules: self.rules.clone(),
             ids: self.ids.clone(),
             events: self.events.clone(),
         });
@@ -283,6 +298,7 @@ impl Engine {
     }
 
     pub fn set_scope(&self, scope: Scope) -> Result<(), EngineError> {
+        let scope = scope.normalized();
         self.store.set_value(SCOPE_KEY, &scope)?;
         *self.scope.write().expect("scope lock") = scope;
         Ok(())
@@ -298,9 +314,28 @@ impl Engine {
         Ok(())
     }
 
+    pub fn match_rules(&self) -> RulesView {
+        self.rules.read().expect("rules lock").view()
+    }
+
+    /// Saves every rule, including ones that cannot run yet, and reports why.
+    pub fn set_match_rules(&self, rules: Vec<MatchRule>) -> Result<RulesView, EngineError> {
+        let set = RuleSet::new(rules);
+        self.store.set_value(RULES_KEY, &set.rules())?;
+        let view = set.view();
+        *self.rules.write().expect("rules lock") = set;
+        Ok(view)
+    }
+
     pub fn list_flows(&self, filter: &FlowFilter) -> Result<Vec<FlowSummary>, EngineError> {
         self.store.flush();
         Ok(self.store.list_flows(filter)?)
+    }
+
+    pub fn site_map(&self, in_scope_only: bool) -> Result<Vec<SiteTree>, EngineError> {
+        self.store.flush();
+        let rows = self.store.site_rows(in_scope_only)?;
+        Ok(site_map::build(rows, &self.scope()))
     }
 
     pub fn flow_detail(&self, id: u64) -> Result<FlowDetail, EngineError> {
@@ -411,11 +446,70 @@ impl Engine {
         let (plan, grep) = fuzzer::prepare(&config, &self.scope())?;
         let info = fuzzer::new_run_info(self.next_id.next(), config, plan.total());
         self.store.save_fuzz_run(&info)?;
+        self.launch_fuzz(info.clone(), plan, grep, HashSet::new())?;
+        Ok(info)
+    }
+
+    /// Continues a stopped attack, sending only the requests with no result yet.
+    pub fn fuzz_resume(self: &Arc<Self>, run_id: u64) -> Result<FuzzRunInfo, EngineError> {
+        self.store.flush();
+        let mut info = self
+            .store
+            .list_fuzz_runs()?
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .ok_or(EngineError::NotFound)?;
+        if info.state != RunState::Stopped {
+            return Err(FuzzError::NotStopped.into());
+        }
+        let (plan, grep) = fuzzer::prepare(&info.config, &self.scope())?;
+        if plan.total() != info.total {
+            return Err(FuzzError::PayloadsChanged.into());
+        }
+        let results = self.store.fuzz_results(run_id)?;
+        if let Some(grep) = &grep {
+            self.recheck_matches(results.clone(), grep)?;
+        }
+        info.state = RunState::Running;
+        self.store.save_fuzz_run(&info)?;
+        let _ = self.ui.send(UiEvent::FuzzState {
+            run_id,
+            state: RunState::Running,
+        });
+        self.launch_fuzz(info.clone(), plan, grep, results.iter().map(|r| r.index).collect())?;
+        Ok(info)
+    }
+
+    /// Keeps results from before a fix to matching consistent with new ones.
+    fn recheck_matches(&self, results: Vec<FuzzResult>, grep: &Regex) -> Result<(), EngineError> {
+        for mut result in results {
+            let Some(response) = self.store.get_flow(result.flow_id)?.and_then(|f| f.response) else {
+                continue;
+            };
+            let matched = fuzzer::response_matches(grep, &response);
+            if matched != result.matched {
+                result.matched = matched;
+                self.store.save_fuzz_result(&result)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_fuzz(
+        self: &Arc<Self>,
+        info: FuzzRunInfo,
+        plan: AttackPlan,
+        grep: Option<Regex>,
+        done: HashSet<u64>,
+    ) -> Result<(), FuzzError> {
         let (control, control_rx) = watch::channel(RunState::Running);
-        self.fuzz_runs
-            .lock()
-            .expect("runs lock")
-            .insert(info.id, FuzzHandle { control });
+        {
+            let mut runs = self.fuzz_runs.lock().expect("runs lock");
+            if runs.contains_key(&info.id) {
+                return Err(FuzzError::NotStopped);
+            }
+            runs.insert(info.id, FuzzHandle { control });
+        }
         let deps = Arc::new(FuzzDeps {
             store: self.store.clone(),
             ids: self.ids.clone(),
@@ -423,13 +517,18 @@ impl Engine {
             ui: self.ui.clone(),
         });
         let engine = self.clone();
-        let run_info = info.clone();
         tokio::spawn(async move {
-            let id = run_info.id;
-            fuzzer::run(run_info, plan, grep, control_rx, deps).await;
-            engine.fuzz_runs.lock().expect("runs lock").remove(&id);
+            let mut info = info;
+            info.state = fuzzer::run(&info, plan, grep, done, control_rx, deps).await;
+            // Released first, so that anyone told it stopped can resume it.
+            engine.fuzz_runs.lock().expect("runs lock").remove(&info.id);
+            let _ = engine.store.save_fuzz_run(&info);
+            let _ = engine.ui.send(UiEvent::FuzzState {
+                run_id: info.id,
+                state: info.state,
+            });
         });
-        Ok(info)
+        Ok(())
     }
 
     /// Asks a running attack to pause, resume or stop.
@@ -437,7 +536,10 @@ impl Engine {
         let runs = self.fuzz_runs.lock().expect("runs lock");
         let handle = runs.get(&run_id).ok_or(EngineError::NotFound)?;
         let _ = handle.control.send(state);
-        let _ = self.ui.send(UiEvent::FuzzState { run_id, state });
+        // A stop is announced by the run itself once it has actually ended.
+        if state != RunState::Stopped {
+            let _ = self.ui.send(UiEvent::FuzzState { run_id, state });
+        }
         Ok(())
     }
 
@@ -458,12 +560,11 @@ impl Engine {
 }
 
 fn detail_of(flow: &Flow) -> FlowDetail {
-    let decoded_response = flow.response.as_deref().and_then(|raw| {
-        let head = parse_response_head(raw).ok()?;
-        let end = find_head_end(raw)?;
-        let decoded = decode_body(&head.headers, &raw[end..]);
-        (decoded != raw[end..]).then(|| RawText::from_bytes(&[&raw[..end], decoded.as_slice()].concat()))
-    });
+    let decoded_response = flow
+        .response
+        .as_deref()
+        .and_then(decode_response)
+        .map(|decoded| RawText::from_bytes(&decoded));
     FlowDetail {
         summary: FlowSummary::of(flow),
         target: flow.target.clone(),

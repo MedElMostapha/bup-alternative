@@ -3,18 +3,23 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { call, dialogs, subscribe, toast } from "../api";
 import { FlowPanes } from "../components/FlowPanes";
 import { RawEditor, type RawEditorHandle } from "../components/RawEditor";
+import { Split } from "../components/Split";
 import { statusClass } from "../format";
+import { useShortcuts } from "../shortcuts";
 import type {
   AttackMode,
   Encoding,
+  FlowActions,
   FlowDetail,
   FuzzConfig,
   FuzzResult,
   FuzzRunInfo,
   PayloadSource,
+  PayloadStep,
   RequestDraft,
   RunState,
   Target,
+  Transform,
 } from "../types";
 
 const MODES: Array<{ value: AttackMode; label: string; help: string }> = [
@@ -31,6 +36,21 @@ type ListDraft =
 
 type SortKey = "index" | "status" | "length" | "duration_ms" | "matched";
 
+type StepKind = "prefix" | "suffix" | Transform;
+type StepDraft = { kind: StepKind; text: string };
+
+const STEP_KINDS: Array<{ value: StepKind; label: string }> = [
+  { value: "prefix", label: "Add prefix" },
+  { value: "suffix", label: "Add suffix" },
+  { value: "url_encode", label: "URL encode" },
+  { value: "url_encode_all", label: "URL encode (every byte)" },
+  { value: "html_encode", label: "HTML encode" },
+  { value: "base64_encode", label: "Base64 encode" },
+  { value: "base64_url_encode", label: "Base64 encode (URL-safe)" },
+  { value: "hex_encode", label: "Hex encode" },
+  { value: "sha256", label: "SHA-256 hash" },
+];
+
 const emptyList = (): ListDraft => ({ kind: "list", text: "" });
 const TERMINAL: RunState[] = ["finished", "stopped"];
 const ROW_HEIGHT = 26;
@@ -44,6 +64,54 @@ function toSource(draft: ListDraft): PayloadSource {
     case "file":
       return { file: draft.path };
   }
+}
+
+function toStep({ kind, text }: StepDraft): PayloadStep {
+  if (kind === "prefix") return { prefix: text };
+  if (kind === "suffix") return { suffix: text };
+  return { transform: kind };
+}
+
+function ProcessingEditor({ steps, onChange }: { steps: StepDraft[]; onChange: (steps: StepDraft[]) => void }) {
+  const edit = (index: number, patch: Partial<StepDraft>) =>
+    onChange(steps.map((step, i) => (i === index ? { ...step, ...patch } : step)));
+  return (
+    <div className="payload">
+      <div className="field-row">
+        <strong>Payload processing</strong>
+        <button onClick={() => onChange([...steps, { kind: "url_encode", text: "" }])}>Add step</button>
+      </div>
+      {steps.length > 0 && <p className="meta">Applied to each payload, from top to bottom.</p>}
+      {steps.map((step, i) => (
+        <div className="field-row" key={i}>
+          <select
+            aria-label={`Processing step ${i + 1}`}
+            value={step.kind}
+            onChange={(e) => edit(i, { kind: e.target.value as StepKind })}
+          >
+            {STEP_KINDS.map((kind) => (
+              <option key={kind.value} value={kind.value}>
+                {kind.label}
+              </option>
+            ))}
+          </select>
+          {(step.kind === "prefix" || step.kind === "suffix") && (
+            <input
+              className="grow"
+              aria-label={`Processing step ${i + 1} text`}
+              placeholder="Text"
+              value={step.text}
+              onChange={(e) => edit(i, { text: e.target.value })}
+            />
+          )}
+          <span className="spacer" />
+          <button className="link" onClick={() => onChange(steps.filter((_, j) => j !== i))}>
+            Remove
+          </button>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PayloadEditor({ draft, onChange, title }: { draft: ListDraft; onChange: (d: ListDraft) => void; title: string }) {
@@ -103,11 +171,13 @@ function ResultsTable({
   results,
   selected,
   onSelect,
+  onMenu,
   hasGrep,
 }: {
   results: FuzzResult[];
   selected: number | null;
   onSelect: (result: FuzzResult) => void;
+  onMenu: (event: React.MouseEvent, result: FuzzResult) => void;
   hasGrep: boolean;
 }) {
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: "index", descending: false });
@@ -152,6 +222,7 @@ function ResultsTable({
                 className={`table-row fuzz-row${row.index === selected ? " selected" : ""}${row.error ? " failed" : ""}`}
                 style={{ position: "absolute", top: 0, left: 0, right: 0, transform: `translateY(${item.start}px)` }}
                 onClick={() => onSelect(row)}
+                onContextMenu={(event) => onMenu(event, row)}
               >
                 <span className="num">{row.index + 1}</span>
                 <span className="clip" title={row.error ?? row.payloads.join(", ")}>
@@ -170,12 +241,22 @@ function ResultsTable({
   );
 }
 
-export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | null; onDraftUsed: () => void; active: boolean }) {
+interface FuzzerProps {
+  draft: RequestDraft | null;
+  onDraftUsed: () => void;
+  active: boolean;
+  flows: FlowActions;
+}
+
+const resultLabel = (result: FuzzResult) => `#${result.index + 1} ${result.payloads.join(" · ")}`.slice(0, 32);
+
+export function Fuzzer({ draft, onDraftUsed, active, flows }: FuzzerProps) {
   const [target, setTarget] = useState<Target>({ host: "localhost", port: 80, tls: false });
   const [template, setTemplate] = useState("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
   const [encoding, setEncoding] = useState<Encoding>("utf8");
   const [mode, setMode] = useState<AttackMode>("single");
   const [lists, setLists] = useState<ListDraft[]>([emptyList()]);
+  const [processing, setProcessing] = useState<StepDraft[]>([]);
   const [concurrency, setConcurrency] = useState(2);
   const [delay, setDelay] = useState(100);
   const [grep, setGrep] = useState("");
@@ -219,13 +300,14 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
       encoding,
       mode,
       payloads: lists.map(toSource),
+      processing: processing.map(toStep),
       concurrency,
       delay_ms: delay,
       grep: grep || null,
       normalize: true,
       timeout_ms: 30000,
     }),
-    [target, template, encoding, mode, lists, concurrency, delay, grep],
+    [target, template, encoding, mode, lists, processing, concurrency, delay, grep],
   );
 
   // Rechecked when the view is shown, since scope is edited in Settings.
@@ -287,6 +369,22 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
     }
   };
 
+  const resume = async () => {
+    if (runId === null) return;
+    try {
+      await call("fuzz_resume", { runId });
+      // Earlier results may have been re-checked against the pattern.
+      const loaded = await call<FuzzResult[]>("fuzz_results", { runId });
+      setResults((items) => {
+        const merged = new Map(items.map((r) => [r.index, r]));
+        loaded.forEach((r) => merged.set(r.index, r));
+        return [...merged.values()];
+      });
+    } catch (error) {
+      toast(error);
+    }
+  };
+
   const control = (state: RunState) => {
     if (runId !== null) call("fuzz_control", { runId, runState: state }).catch(toast);
   };
@@ -309,8 +407,18 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
 
   const help = MODES.find((m) => m.value === mode)?.help;
 
+  useShortcuts(active, {
+    r: () => selected && flows.send(selected.flow_id, "repeater"),
+    i: () => selected && flows.send(selected.flow_id, "fuzzer"),
+  });
+
+  const rowMenu = (event: React.MouseEvent, row: FuzzResult) => {
+    setSelected(row);
+    flows.menu(event, row.flow_id, resultLabel(row));
+  };
+
   return (
-    <div className="fuzzer">
+    <Split id="fuzzer" direction="row" initial={0.28} min={280} className="fuzzer">
       <div className="fuzz-config">
         <div className="field-row">
           <input
@@ -361,6 +469,7 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
             onChange={(next) => setLists(lists.map((item, j) => (j === i ? next : item)))}
           />
         ))}
+        <ProcessingEditor steps={processing} onChange={setProcessing} />
         <div className="field-row">
           <label className="stacked">
             Parallel requests
@@ -411,6 +520,7 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
           {run?.state === "running" && <button onClick={() => control("paused")}>Pause</button>}
           {run?.state === "paused" && <button onClick={() => control("running")}>Resume</button>}
           {running && <button onClick={() => control("stopped")}>Stop</button>}
+          {run?.state === "stopped" && results.length < run.total && <button onClick={resume}>Resume</button>}
         </div>
         {statusCounts.length > 0 && (
           <div className="toolbar compact">
@@ -435,24 +545,27 @@ export function Fuzzer({ draft, onDraftUsed, active }: { draft: RequestDraft | n
             )}
           </div>
         )}
-        {run ? (
-          <ResultsTable
-            results={visibleResults}
-            selected={selected?.index ?? null}
-            onSelect={setSelected}
-            hasGrep={Boolean(run.config.grep)}
-          />
-        ) : (
-          <p className="empty">
-            Mark at least one position, add payloads, and make sure the target is in scope. Results appear here.
-          </p>
-        )}
-        {detail && (
-          <div className="detail">
-            <FlowPanes detail={detail} />
-          </div>
-        )}
+        <Split id="fuzz-results" direction="column" initial={0.5} min={100}>
+          {run ? (
+            <ResultsTable
+              results={visibleResults}
+              selected={selected?.index ?? null}
+              onSelect={setSelected}
+              onMenu={rowMenu}
+              hasGrep={Boolean(run.config.grep)}
+            />
+          ) : (
+            <p className="empty">
+              Mark at least one position, add payloads, and make sure the target is in scope. Results appear here.
+            </p>
+          )}
+          {detail && selected && (
+            <div className="detail">
+              <FlowPanes detail={detail} flows={flows} label={resultLabel(selected)} />
+            </div>
+          )}
+        </Split>
       </div>
-    </div>
+    </Split>
   );
 }

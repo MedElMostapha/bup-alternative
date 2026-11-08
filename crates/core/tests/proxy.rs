@@ -1,5 +1,6 @@
 //! Drives a real proxy instance against local HTTP, TLS and WebSocket servers.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -7,10 +8,11 @@ use std::time::Duration;
 
 use sluice_core::ca::CertAuthority;
 use sluice_core::http::{parse_request_head, parse_response_head, request_framing, response_framing, BodyState, MessageReader};
-use sluice_core::intercept::{Intercept, Verdict};
+use sluice_core::intercept::{Direction, Intercept, Verdict};
+use sluice_core::match_replace::{MatchRule, RuleKind, RuleSet};
 use sluice_core::model::{IdGen, Target};
 use sluice_core::proxy::{self, Event, ProxyCtx, ProxyHandle, ProxySettings};
-use sluice_core::scope::Scope;
+use sluice_core::scope::{Scope, ScopeRule};
 use sluice_core::upstream::{send_raw, SendOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -55,6 +57,14 @@ impl Origin {
                     let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG_SIZE}\r\n\r\n");
                     stream.write_all(head.as_bytes()).await.unwrap();
                     stream.write_all(&vec![b'x'; BIG_SIZE]).await.unwrap();
+                }
+                "/gzip" => {
+                    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(b"secret=alpha").unwrap();
+                    let body = encoder.finish().unwrap();
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", body.len());
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
                 }
                 "/until-close" => {
                     stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nthe whole body").await.unwrap();
@@ -132,6 +142,8 @@ struct Harness {
     ca: Arc<CertAuthority>,
     intercept: Arc<Intercept>,
     settings: Arc<RwLock<ProxySettings>>,
+    scope: Arc<RwLock<Scope>>,
+    rules: Arc<RwLock<RuleSet>>,
     events: Arc<Mutex<Vec<Event>>>,
     handle: ProxyHandle,
 }
@@ -150,11 +162,14 @@ impl Harness {
                 sink.lock().unwrap().push(event);
             }
         });
+        let scope = Arc::new(RwLock::new(Scope::default()));
+        let rules = Arc::new(RwLock::new(RuleSet::default()));
         let ctx = Arc::new(ProxyCtx {
             ca: ca.clone(),
-            scope: Arc::new(RwLock::new(Scope::default())),
+            scope: scope.clone(),
             intercept: intercept.clone(),
             settings: settings.clone(),
+            rules: rules.clone(),
             ids: Arc::new(IdGen::default()),
             events: tx,
         });
@@ -164,6 +179,8 @@ impl Harness {
             ca,
             intercept,
             settings,
+            scope,
+            rules,
             events,
             handle,
         }
@@ -171,6 +188,10 @@ impl Harness {
 
     async fn connect(&self) -> MessageReader<TcpStream> {
         MessageReader::new(TcpStream::connect(self.handle.local_addr).await.unwrap())
+    }
+
+    fn set_rules(&self, rules: Vec<MatchRule>) {
+        *self.rules.write().unwrap() = RuleSet::new(rules);
     }
 
     fn tls_connector(&self) -> TlsConnector {
@@ -480,4 +501,100 @@ async fn send_raw_delivers_exact_bytes() {
     assert_eq!(origin.last_request(), request);
     assert!(exchange.response.starts_with(b"HTTP/1.1 200 OK"));
     assert!(exchange.response.ends_with(b"connection=1"));
+}
+
+fn rule(direction: Direction, kind: RuleKind, pattern: &str, replacement: &str) -> MatchRule {
+    MatchRule {
+        enabled: true,
+        direction,
+        kind,
+        pattern: pattern.into(),
+        replacement: replacement.into(),
+        regex: false,
+    }
+}
+
+async fn get(client: &mut MessageReader<TcpStream>, addr: SocketAddr, path: &str) -> Vec<u8> {
+    let request = format!("GET http://{addr}{path} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    client.stream_mut().write_all(request.as_bytes()).await.unwrap();
+    read_response(client, "GET").await.1
+}
+
+#[tokio::test]
+async fn match_rules_rewrite_requests_and_are_recorded() {
+    let harness = Harness::start().await;
+    let (addr, origin) = spawn_plain_origin().await;
+    harness.set_rules(vec![rule(Direction::Request, RuleKind::SetHeader, "X-Test", "yes")]);
+    let mut client = harness.connect().await;
+    get(&mut client, addr, "/").await;
+
+    let expected = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nX-Test: yes\r\n\r\n");
+    assert_eq!(origin.last_request(), expected.as_bytes());
+    let flow = harness.finished_flow(1).await;
+    assert_eq!(flow.request, expected.as_bytes());
+    assert!(flow.edited);
+}
+
+#[tokio::test]
+async fn a_rewritten_request_body_gets_the_right_length() {
+    let harness = Harness::start().await;
+    let (addr, origin) = spawn_plain_origin().await;
+    harness.set_rules(vec![rule(Direction::Request, RuleKind::ReplaceBody, "abc", "longer")]);
+    let mut client = harness.connect().await;
+    let request = format!("POST http://{addr}/ HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 3\r\n\r\nabc");
+    client.stream_mut().write_all(request.as_bytes()).await.unwrap();
+    assert_eq!(read_response(&mut client, "POST").await.0, 200);
+    let expected = format!("POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 6\r\n\r\nlonger");
+    assert_eq!(origin.last_request(), expected.as_bytes());
+}
+
+#[tokio::test]
+async fn match_rules_rewrite_compressed_responses_and_keep_the_connection() {
+    let harness = Harness::start().await;
+    let (addr, origin) = spawn_plain_origin().await;
+    harness.set_rules(vec![rule(Direction::Response, RuleKind::ReplaceBody, "alpha", "omega")]);
+    let mut client = harness.connect().await;
+    assert_eq!(get(&mut client, addr, "/gzip").await, b"secret=omega");
+    assert_eq!(get(&mut client, addr, "/").await, b"connection=1", "the client connection stays usable");
+    assert_eq!(origin.count(), 2);
+
+    let flow = harness.finished_flow(1).await;
+    let recorded = String::from_utf8(flow.response.unwrap()).unwrap();
+    assert_eq!(recorded, "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nsecret=omega");
+    assert!(flow.edited);
+    assert!(!harness.finished_flow(2).await.edited, "a response with no match is not marked");
+}
+
+#[tokio::test]
+async fn match_rules_cover_response_headers_on_streamed_bodies() {
+    let harness = Harness::start().await;
+    let (addr, _) = spawn_plain_origin().await;
+    harness.settings.write().unwrap().body_cap = 1024;
+    harness.set_rules(vec![
+        rule(Direction::Response, RuleKind::ReplaceBody, "x", "y"),
+        rule(Direction::Response, RuleKind::SetHeader, "X-Seen", "1"),
+    ]);
+    let mut client = harness.connect().await;
+    let body = get(&mut client, addr, "/big").await;
+    assert_eq!(body.len(), BIG_SIZE);
+    assert!(body.iter().all(|b| *b == b'x'), "a body over the cap streams through unchanged");
+
+    let flow = harness.finished_flow(1).await;
+    assert!(flow.truncated);
+    assert!(String::from_utf8_lossy(&flow.response.unwrap()).contains("X-Seen: 1\r\n"));
+}
+
+#[tokio::test]
+async fn match_rules_leave_out_of_scope_targets_alone() {
+    let harness = Harness::start().await;
+    let (addr, origin) = spawn_plain_origin().await;
+    harness.scope.write().unwrap().include.push(ScopeRule {
+        host: "elsewhere.test".into(),
+        path_prefix: String::new(),
+    });
+    harness.set_rules(vec![rule(Direction::Request, RuleKind::SetHeader, "X-Secret", "token")]);
+    let mut client = harness.connect().await;
+    get(&mut client, addr, "/").await;
+    assert_eq!(origin.last_request(), format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes());
+    assert!(!harness.finished_flow(1).await.edited);
 }

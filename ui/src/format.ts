@@ -1,3 +1,14 @@
+import type { FlowDetail, RequestDraft } from "./types";
+
+export function draftOf(detail: FlowDetail): RequestDraft {
+  return {
+    target: detail.target,
+    request: detail.request,
+    label: `${detail.summary.method} ${detail.summary.path}`.slice(0, 40),
+    nonce: Date.now(),
+  };
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -19,7 +30,7 @@ export function statusClass(status: number | null): string {
 const DISPLAY_LIMIT = 2 * 1024 * 1024;
 
 /** Keeps the editor responsive on very large messages. */
-export function clipForDisplay(text: string): string {
+export function clipForDisplay(text: string, note = "The full message is in the project file."): string {
   if (text.length <= DISPLAY_LIMIT) return text;
-  return `${text.slice(0, DISPLAY_LIMIT)}\n\n[Display limited to 2 MB. The full message is in the project file.]`;
+  return `${text.slice(0, DISPLAY_LIMIT)}\n\n[Display limited to 2 MB. ${note}]`;
 }

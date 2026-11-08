@@ -7,14 +7,18 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sluice_core::browser::{BrowserInfo, BrowserKind};
+use sluice_core::comparer::{self, Comparison};
+use sluice_core::decoder::{self, DecoderRun, Transform};
 use sluice_core::engine::{Engine, EngineError, FlowDetail, PendingView, ProxyStatus, SendRequest, UiEvent};
 use sluice_core::fuzzer::{FuzzConfig, FuzzResult, FuzzRunInfo, RunState};
 use sluice_core::intercept::Verdict;
+use sluice_core::match_replace::{MatchRule, RulesView};
 use sluice_core::model::Target;
 use sluice_core::proxy::ProxySettings;
 use sluice_core::repeater::{normalize_message, RepeaterTab};
 use sluice_core::scanner::Finding;
 use sluice_core::scope::Scope;
+use sluice_core::site_map::SiteTree;
 use sluice_core::store::{FlowFilter, FlowSummary};
 use sluice_core::text::RawText;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -144,6 +148,16 @@ fn set_settings(state: State<'_, AppState>, settings: ProxySettings) -> CommandR
 }
 
 #[tauri::command]
+fn get_match_rules(state: State<'_, AppState>) -> RulesView {
+    state.engine().match_rules()
+}
+
+#[tauri::command]
+fn set_match_rules(state: State<'_, AppState>, rules: Vec<MatchRule>) -> CommandResult<RulesView> {
+    state.engine().set_match_rules(rules).map_err(text_error)
+}
+
+#[tauri::command]
 fn ca_pem(state: State<'_, AppState>) -> String {
     state.engine().ca_pem()
 }
@@ -156,6 +170,11 @@ fn export_ca(state: State<'_, AppState>, path: String) -> CommandResult<()> {
 #[tauri::command]
 async fn list_flows(state: State<'_, AppState>, filter: FlowFilter) -> CommandResult<Vec<FlowSummary>> {
     blocking(state, move |engine| engine.list_flows(&filter)).await
+}
+
+#[tauri::command]
+async fn site_map(state: State<'_, AppState>, in_scope_only: bool) -> CommandResult<Vec<SiteTree>> {
+    blocking(state, move |engine| engine.site_map(in_scope_only)).await
 }
 
 #[tauri::command]
@@ -273,6 +292,11 @@ async fn fuzz_start(state: State<'_, AppState>, config: FuzzConfig) -> CommandRe
 }
 
 #[tauri::command]
+async fn fuzz_resume(state: State<'_, AppState>, run_id: u64) -> CommandResult<FuzzRunInfo> {
+    blocking(state, move |engine| engine.fuzz_resume(run_id)).await
+}
+
+#[tauri::command]
 fn fuzz_control(state: State<'_, AppState>, run_id: u64, run_state: RunState) -> CommandResult<()> {
     state.engine().fuzz_control(run_id, run_state).map_err(text_error)
 }
@@ -285,6 +309,27 @@ async fn list_fuzz_runs(state: State<'_, AppState>) -> CommandResult<Vec<FuzzRun
 #[tauri::command]
 async fn fuzz_results(state: State<'_, AppState>, run_id: u64) -> CommandResult<Vec<FuzzResult>> {
     blocking(state, move |engine| engine.fuzz_results(run_id)).await
+}
+
+#[tauri::command]
+async fn decoder_run(input: String, steps: Vec<Transform>) -> CommandResult<DecoderRun> {
+    tauri::async_runtime::spawn_blocking(move || decoder::run(input.as_bytes(), &steps))
+        .await
+        .map_err(text_error)
+}
+
+#[tauri::command]
+async fn decoder_smart(input: String) -> CommandResult<Vec<Transform>> {
+    tauri::async_runtime::spawn_blocking(move || decoder::smart_steps(input.as_bytes()))
+        .await
+        .map_err(text_error)
+}
+
+#[tauri::command]
+async fn comparer_diff(a: RawText, b: RawText, body_only: bool, context: Option<usize>) -> CommandResult<Comparison> {
+    tauri::async_runtime::spawn_blocking(move || comparer::compare(&a.to_bytes(), &b.to_bytes(), body_only, context))
+        .await
+        .map_err(text_error)
 }
 
 #[tauri::command]
@@ -327,9 +372,12 @@ fn main() {
             set_scope,
             get_settings,
             set_settings,
+            get_match_rules,
+            set_match_rules,
             ca_pem,
             export_ca,
             list_flows,
+            site_map,
             flow_detail,
             ws_frames,
             clear_history,
@@ -345,9 +393,13 @@ fn main() {
             repeater_cancel,
             fuzz_preview,
             fuzz_start,
+            fuzz_resume,
             fuzz_control,
             list_fuzz_runs,
             fuzz_results,
+            decoder_run,
+            decoder_smart,
+            comparer_diff,
             list_findings,
         ])
         .run(tauri::generate_context!())

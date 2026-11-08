@@ -1,6 +1,7 @@
 //! Sends a template request many times with payloads substituted at marked
 //! positions, within limits the user can see before anything is sent.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -10,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::decoder::Transform;
 use crate::engine::UiEvent;
+use crate::http::decode::decode_response;
 use crate::http::parse_request_head;
 use crate::model::{now_ms, Flow, IdGen, Source, Target};
 use crate::repeater::normalize_message;
@@ -47,6 +50,10 @@ pub enum FuzzError {
     BadConcurrency,
     #[error("number range is invalid")]
     BadRange,
+    #[error("only a stopped run can be resumed")]
+    NotStopped,
+    #[error("this run's payloads have changed since it started; start a new run instead")]
+    PayloadsChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +103,15 @@ impl PayloadSource {
     }
 }
 
+/// One change made to every payload, in the order listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadStep {
+    Prefix(String),
+    Suffix(String),
+    Transform(Transform),
+}
+
 fn default_concurrency() -> usize {
     2
 }
@@ -119,6 +135,8 @@ pub struct FuzzConfig {
     pub encoding: Encoding,
     pub mode: AttackMode,
     pub payloads: Vec<PayloadSource>,
+    #[serde(default)]
+    pub processing: Vec<PayloadStep>,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Minimum gap between starting one request and the next.
@@ -139,6 +157,8 @@ pub struct AttackPlan {
     segments: Vec<Vec<u8>>,
     mode: AttackMode,
     lists: Vec<Vec<Vec<u8>>>,
+    processing: Vec<PayloadStep>,
+    encoding: Encoding,
     total: u64,
     normalize: bool,
 }
@@ -187,6 +207,8 @@ impl AttackPlan {
             segments: parts.iter().map(|s| encode(s, config.encoding)).collect(),
             mode: config.mode,
             lists,
+            processing: config.processing.clone(),
+            encoding: config.encoding,
             total: total as u64,
             normalize: config.normalize,
         })
@@ -242,7 +264,21 @@ impl AttackPlan {
         }
     }
 
-    /// The request as it would be sent, plus readable payload labels.
+    fn process(&self, payload: &[u8]) -> Vec<u8> {
+        let mut current = payload.to_vec();
+        for step in &self.processing {
+            match step {
+                PayloadStep::Prefix(text) => current.splice(0..0, encode(text, self.encoding)).for_each(drop),
+                PayloadStep::Suffix(text) => current.extend(encode(text, self.encoding)),
+                // Only a decoding step can fail, and then there is nothing better to send.
+                PayloadStep::Transform(transform) => current = transform.apply(&current).unwrap_or(current),
+            }
+        }
+        current
+    }
+
+    /// The request as it would be sent, plus labels naming each payload before
+    /// processing, since that is the value the user recognizes.
     pub fn build(&self, index: u64) -> (Vec<u8>, Vec<String>) {
         let chosen = self.choose(index);
         let labels = chosen
@@ -250,7 +286,9 @@ impl AttackPlan {
             .flatten()
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .collect();
-        (self.render(&chosen), labels)
+        let processed: Vec<Option<Vec<u8>>> = chosen.iter().map(|p| p.map(|p| self.process(p))).collect();
+        let final_payloads: Vec<Option<&[u8]>> = processed.iter().map(Option::as_deref).collect();
+        (self.render(&final_payloads), labels)
     }
 
     /// The template with every position left at its default value.
@@ -320,6 +358,14 @@ pub fn prepare(config: &FuzzConfig, scope: &Scope) -> Result<(AttackPlan, Option
     Ok((plan, grep))
 }
 
+/// Tests a response as it reads decompressed, not its compressed bytes.
+pub fn response_matches(grep: &Regex, response: &[u8]) -> bool {
+    match decode_response(response) {
+        Some(decoded) => grep.is_match(&decoded),
+        None => grep.is_match(response),
+    }
+}
+
 async fn send_one(
     run_id: u64,
     index: u64,
@@ -361,7 +407,7 @@ async fn send_one(
         status: response.and_then(|r| crate::http::parse_response_head(r).ok()).map(|h| h.status),
         length: response.map_or(0, |r| r.len() as u64),
         duration_ms: flow.duration_ms.unwrap_or(0),
-        matched: grep.zip(response).is_some_and(|(g, r)| g.is_match(r)),
+        matched: grep.zip(response).is_some_and(|(g, r)| response_matches(&g, r)),
         error: flow.error.clone(),
     };
     deps.store.save_flow(flow);
@@ -369,21 +415,23 @@ async fn send_one(
     let _ = deps.ui.send(UiEvent::FuzzResult(result));
 }
 
-/// Runs an attack to completion. `control` pauses or stops it.
+/// Runs an attack to completion, skipping the indexes in `done`, and returns
+/// how it ended. `control` pauses or stops it.
 pub async fn run(
-    mut info: FuzzRunInfo,
+    info: &FuzzRunInfo,
     plan: AttackPlan,
     grep: Option<Regex>,
+    done: HashSet<u64>,
     mut control: watch::Receiver<RunState>,
     deps: Arc<FuzzDeps>,
-) {
+) -> RunState {
     let config = Arc::new(info.config.clone());
     let delay = Duration::from_millis(config.delay_ms);
     let permits = Arc::new(Semaphore::new(config.concurrency));
     let mut tasks = JoinSet::new();
     let mut final_state = RunState::Finished;
 
-    'dispatch: for index in 0..plan.total() {
+    'dispatch: for index in (0..plan.total()).filter(|i| !done.contains(i)) {
         loop {
             let state = *control.borrow_and_update();
             match state {
@@ -416,7 +464,13 @@ pub async fn run(
         });
         while tasks.try_join_next().is_some() {}
         if !delay.is_zero() && index + 1 < plan.total() {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = control.wait_for(|s| *s == RunState::Stopped) => {
+                    final_state = RunState::Stopped;
+                    break 'dispatch;
+                }
+            }
         }
     }
 
@@ -425,12 +479,7 @@ pub async fn run(
     } else {
         while tasks.join_next().await.is_some() {}
     }
-    info.state = final_state;
-    let _ = deps.store.save_fuzz_run(&info);
-    let _ = deps.ui.send(UiEvent::FuzzState {
-        run_id: info.id,
-        state: final_state,
-    });
+    final_state
 }
 
 pub fn new_run_info(id: u64, config: FuzzConfig, total: u64) -> FuzzRunInfo {
@@ -459,6 +508,7 @@ mod tests {
             encoding: Encoding::Utf8,
             mode,
             payloads,
+            processing: vec![],
             concurrency: 2,
             delay_ms: 0,
             grep: None,
@@ -501,6 +551,53 @@ mod tests {
         let lists = vec![list(&["1", "2"]), list(&["x", "y"])];
         let plan = AttackPlan::new(&config("§a§-§b§", AttackMode::Combinations, lists)).unwrap();
         assert_eq!(all(&plan), ["1-x", "1-y", "2-x", "2-y"]);
+    }
+
+    #[test]
+    fn processing_runs_in_order_on_each_payload() {
+        let mut cfg = config("§a§", AttackMode::Same, vec![list(&["a b", "<"])]);
+        cfg.processing = vec![
+            PayloadStep::Prefix("x".into()),
+            PayloadStep::Transform(Transform::UrlEncode),
+            PayloadStep::Suffix("/".into()),
+        ];
+        let plan = AttackPlan::new(&cfg).unwrap();
+        assert_eq!(all(&plan), ["xa%20b/", "x%3C/"]);
+    }
+
+    #[test]
+    fn base64_and_hashes_apply_after_earlier_steps() {
+        let mut cfg = config("§a§", AttackMode::Same, vec![list(&["abc"])]);
+        cfg.processing = vec![PayloadStep::Transform(Transform::Base64Encode)];
+        assert_eq!(all(&AttackPlan::new(&cfg).unwrap()), ["YWJj"]);
+        cfg.processing = vec![PayloadStep::Prefix("a".into()), PayloadStep::Transform(Transform::Sha256)];
+        assert_eq!(
+            all(&AttackPlan::new(&cfg).unwrap()),
+            ["223189358b15aac5609ec6d35ccfa7df93b8f2507344c03445351586b0459228"]
+        );
+    }
+
+    #[test]
+    fn processing_leaves_defaults_and_labels_alone() {
+        let mut cfg = config("§a§-§b§", AttackMode::Single, vec![list(&["1"])]);
+        cfg.processing = vec![PayloadStep::Prefix("p".into())];
+        let plan = AttackPlan::new(&cfg).unwrap();
+        assert_eq!(plan.build(0), (b"p1-b".to_vec(), vec!["1".to_string()]));
+        assert_eq!(plan.build(1), (b"a-p1".to_vec(), vec!["1".to_string()]));
+    }
+
+    #[test]
+    fn saved_runs_without_processing_still_load() {
+        let mut json = serde_json::to_value(config("§a§", AttackMode::Same, vec![list(&["1"])])).unwrap();
+        json.as_object_mut().unwrap().remove("processing");
+        let loaded: FuzzConfig = serde_json::from_value(json).unwrap();
+        assert!(loaded.processing.is_empty());
+    }
+
+    #[test]
+    fn processing_steps_use_the_names_the_interface_sends() {
+        let parsed: Vec<PayloadStep> = serde_json::from_str(r#"[{"prefix":"a"},{"transform":"sha256"}]"#).unwrap();
+        assert_eq!(parsed, [PayloadStep::Prefix("a".into()), PayloadStep::Transform(Transform::Sha256)]);
     }
 
     #[test]

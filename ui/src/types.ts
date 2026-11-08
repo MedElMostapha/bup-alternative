@@ -1,3 +1,5 @@
+import type { MenuItem } from "./components/ContextMenu";
+
 export type Encoding = "utf8" | "latin1";
 export interface RawText {
   text: string;
@@ -41,6 +43,17 @@ export interface FlowDetail {
   decoded_response: RawText | null;
 }
 
+export type SortColumn =
+  | "id"
+  | "started_ms"
+  | "method"
+  | "host"
+  | "path"
+  | "status"
+  | "response_len"
+  | "duration_ms"
+  | "mime";
+
 export interface FlowFilter {
   source?: Source;
   host?: string;
@@ -51,6 +64,10 @@ export interface FlowFilter {
   in_scope_only?: boolean;
   before_id?: number;
   limit?: number;
+  sort?: SortColumn;
+  ascending?: boolean;
+  offset?: number;
+  site?: { target: Target; path: string };
 }
 
 export interface WsFrameView {
@@ -111,6 +128,7 @@ export type PayloadSource =
   | { list: string[] }
   | { file: string }
   | { numbers: { from: number; to: number; step: number } };
+export type PayloadStep = { prefix: string } | { suffix: string } | { transform: Transform };
 export type RunState = "running" | "paused" | "stopped" | "finished";
 
 export interface FuzzConfig {
@@ -119,6 +137,7 @@ export interface FuzzConfig {
   encoding: Encoding;
   mode: AttackMode;
   payloads: PayloadSource[];
+  processing: PayloadStep[];
   concurrency: number;
   delay_ms: number;
   grep: string | null;
@@ -146,6 +165,72 @@ export interface FuzzResult {
   error: string | null;
 }
 
+export type Transform =
+  | "url_decode"
+  | "form_decode"
+  | "html_decode"
+  | "base64_decode"
+  | "hex_decode"
+  | "gzip_decode"
+  | "url_encode"
+  | "url_encode_all"
+  | "html_encode"
+  | "base64_encode"
+  | "base64_url_encode"
+  | "hex_encode"
+  | "gzip_encode"
+  | "sha256";
+
+export interface StepOutput {
+  raw: RawText;
+  length: number;
+}
+
+export interface DecoderRun {
+  outputs: StepOutput[];
+  error: string | null;
+}
+
+export interface DiffSpan {
+  text: string;
+  changed: boolean;
+}
+
+export interface DiffSide {
+  number: number;
+  spans: DiffSpan[];
+}
+
+export type ComparisonRow =
+  | { kind: "same" | "changed"; a: DiffSide; b: DiffSide }
+  | { kind: "removed"; a: DiffSide }
+  | { kind: "added"; b: DiffSide }
+  | { kind: "gap"; lines: number };
+
+export interface Comparison {
+  rows: ComparisonRow[];
+  changed: number;
+  removed: number;
+  added: number;
+  clipped: boolean;
+}
+
+export type RuleKind = "set_header" | "remove_header" | "replace_first_line" | "replace_headers" | "replace_body";
+
+export interface MatchRule {
+  enabled: boolean;
+  direction: "request" | "response";
+  kind: RuleKind;
+  pattern: string;
+  replacement: string;
+  regex: boolean;
+}
+
+export interface MatchRules {
+  rules: MatchRule[];
+  errors: Array<string | null>;
+}
+
 export type Severity = "info" | "low" | "medium" | "high";
 
 export interface Finding {
@@ -169,6 +254,43 @@ export type UiEvent =
   | ({ kind: "finding" } & Finding)
   | ({ kind: "fuzz_result" } & FuzzResult)
   | { kind: "fuzz_state"; run_id: number; state: RunState };
+
+/** One response picked for comparing. */
+export interface CompareSide {
+  flowId?: number;
+  label: string;
+  raw: RawText;
+}
+
+export interface ComparerDraft {
+  a: CompareSide;
+  b: CompareSide;
+  nonce: number;
+}
+
+/** What every table can do with the flow on one of its rows. */
+export interface FlowActions {
+  send: (id: number, destination: "repeater" | "fuzzer") => void;
+  /** `selection` is text highlighted in a pane, offered for copying. */
+  menu: (event: React.MouseEvent, id: number, label: string, selection?: string) => void;
+  items: (id: number, label: string, selection?: string) => MenuItem[];
+  addScopeRule: (list: "include" | "exclude", host: string, pathPrefix?: string) => void;
+}
+
+export interface SiteNode {
+  name: string;
+  path: string;
+  requests: number;
+  flow_id: number | null;
+  status: number | null;
+  in_scope: boolean;
+  children: SiteNode[];
+}
+
+export interface SiteTree {
+  target: Target;
+  root: SiteNode;
+}
 
 /** A request handed from one view to another. */
 export interface RequestDraft {

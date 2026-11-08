@@ -99,10 +99,12 @@ interface Props {
   value: string;
   onChange?: (value: string) => void;
   readOnly?: boolean;
+  /** Not an HTTP message, so no header or position highlighting. */
+  plain?: boolean;
   handleRef?: React.RefObject<RawEditorHandle | null>;
 }
 
-export function RawEditor({ value, onChange, readOnly = false, handleRef }: Props) {
+export function RawEditor({ value, onChange, readOnly = false, plain = false, handleRef }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const changeHandler = useRef(onChange);
@@ -134,7 +136,7 @@ export function RawEditor({ value, onChange, readOnly = false, handleRef }: Prop
           }),
           keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
           EditorView.lineWrapping,
-          httpHighlight,
+          ...(plain ? [] : [httpHighlight]),
           theme,
           EditorView.updateListener.of((update) => {
             if (update.docChanged) changeHandler.current?.(update.state.doc.toString());

@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { call, subscribe, toast } from "../api";
 import { FlowPanes } from "../components/FlowPanes";
-import type { Finding, FlowDetail, Severity } from "../types";
+import { Split } from "../components/Split";
+import { useShortcuts } from "../shortcuts";
+import type { Finding, FlowActions, FlowDetail, Severity } from "../types";
 
 const ORDER: Record<Severity, number> = { high: 0, medium: 1, low: 2, info: 3 };
 const LEVELS: Severity[] = ["high", "medium", "low", "info"];
 
-export function Findings() {
+export function Findings({ active, flows }: { active: boolean; flows: FlowActions }) {
   const [findings, setFindings] = useState<Finding[]>([]);
   const [hidden, setHidden] = useState<Set<Severity>>(new Set());
   const [selected, setSelected] = useState<Finding | null>(null);
@@ -44,6 +46,11 @@ export function Findings() {
     [findings, hidden],
   );
 
+  useShortcuts(active, {
+    r: () => selected && flows.send(selected.flow_id, "repeater"),
+    i: () => selected && flows.send(selected.flow_id, "fuzzer"),
+  });
+
   const toggle = (level: Severity) => {
     setHidden((current) => {
       const next = new Set(current);
@@ -53,7 +60,7 @@ export function Findings() {
   };
 
   return (
-    <div className="findings">
+    <Split id="findings" direction="row" initial={0.28} min={220} className="findings">
       <aside className="finding-list">
         <div className="toolbar">
           {LEVELS.map((level) => (
@@ -76,6 +83,10 @@ export function Findings() {
               key={`${finding.rule}|${finding.host}|${finding.dedupe}`}
               className={`finding${finding === selected ? " selected" : ""}`}
               onClick={() => setSelected(finding)}
+              onContextMenu={(event) => {
+                setSelected(finding);
+                flows.menu(event, finding.flow_id, finding.title.slice(0, 32));
+              }}
             >
               <span className={`dot sev-${finding.severity}`} aria-label={finding.severity} />
               <span className="finding-text">
@@ -101,12 +112,12 @@ export function Findings() {
               </p>
               <p className="meta">Reported by passive inspection only. Confirm it before relying on it.</p>
             </div>
-            {detail && <FlowPanes detail={detail} />}
+            {detail && <FlowPanes detail={detail} flows={flows} label={selected.title.slice(0, 32)} />}
           </>
         ) : (
           <p className="empty">Select a finding to see the evidence.</p>
         )}
       </section>
-    </div>
+    </Split>
   );
 }

@@ -15,7 +15,7 @@ function RuleList({ title, rules, onChange }: { title: string; rules: ScopeRule[
           <input
             className="grow"
             aria-label={`${title} host pattern`}
-            placeholder="*.example.test"
+            placeholder="example.test or *.example.test"
             value={rule.host}
             onChange={(e) => edit(i, { host: e.target.value })}
           />

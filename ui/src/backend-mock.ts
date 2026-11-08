@@ -1,6 +1,6 @@
 // Sample data so the interface can be viewed in a plain browser during
 // development. Vite leaves this file out of production builds.
-import type { Finding, FlowDetail, FlowSummary, PendingView, RawText, UiEvent } from "./types";
+import type { Finding, FlowDetail, FlowFilter, FlowSummary, MatchRule, PendingView, RawText, SiteNode, SiteTree, UiEvent } from "./types";
 
 const raw = (text: string): RawText => ({ text, encoding: "utf8" });
 
@@ -28,15 +28,17 @@ const flows: FlowSummary[] = Array.from({ length: 60 }, (_, i) => ({
 const request = raw(
   "POST /v1/orders HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: curl/8.5\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"item\":§42§,\"n\":1}",
 );
-const response = raw(
-  'HTTP/1.1 200 OK\r\nServer: nginx/1.25.3\r\nContent-Type: application/json\r\nSet-Cookie: sid=…; Path=/\r\n\r\n{\n  "ok": true,\n  "order": 981\n}\n',
-);
+const sampleResponse = (order: number) =>
+  raw(
+    `HTTP/1.1 200 OK\r\nServer: nginx/1.25.3\r\nContent-Type: application/json\r\nSet-Cookie: sid=…; Path=/\r\n\r\n{\n  "ok": true,\n  "order": ${order}\n}\n`,
+  );
+const response = sampleResponse(981);
 
 const detail = (id: number): FlowDetail => ({
   summary: flows.find((f) => f.id === id) ?? flows[0],
   target: { host: "api.example.test", port: 443, tls: true },
   request,
-  response,
+  response: sampleResponse(id),
   decoded_response: null,
 });
 
@@ -106,7 +108,103 @@ const answers: Record<string, unknown> = {
   ws_frames: [],
 };
 
+const MOCK_CONVERSIONS: Record<string, (text: string) => string> = {
+  url_decode: decodeURIComponent,
+  url_encode: encodeURIComponent,
+  base64_decode: atob,
+  base64_encode: btoa,
+};
+
+function mockDecoder(input: string, steps: string[]) {
+  const outputs = [];
+  let current = input;
+  for (const step of steps) {
+    try {
+      current = (MOCK_CONVERSIONS[step] ?? ((text: string) => text))(current);
+    } catch {
+      return { outputs, error: `sample data cannot run ${step} on this input` };
+    }
+    outputs.push({ raw: { text: current, encoding: "utf8" }, length: current.length });
+  }
+  return { outputs, error: null };
+}
+
+function mockCompare(a: RawText, b: RawText) {
+  const [left, right] = [a.text.split("\n"), b.text.split("\n")];
+  let changed = 0;
+  const rows = left.map((line, i) => {
+    const same = line === right[i];
+    if (!same) changed += 1;
+    const side = (text: string) => ({ number: i + 1, spans: [{ text, changed: !same }] });
+    return { kind: same ? "same" : "changed", a: side(line), b: side(right[i] ?? "") };
+  });
+  return { rows, changed, removed: 0, added: 0, clipped: false };
+}
+
+function mockSiteMap(): SiteTree[] {
+  const node = (name: string, path: string): SiteNode => ({ name, path, requests: 0, flow_id: null, status: null, in_scope: true, children: [] });
+  const roots = new Map<string, SiteTree>();
+  for (const flow of [...flows].reverse()) {
+    if (!roots.has(flow.host)) {
+      roots.set(flow.host, { target: { host: flow.host, port: flow.port, tls: flow.tls }, root: node("", "") });
+    }
+    let at = roots.get(flow.host)!.root;
+    at.requests += 1;
+    for (const name of flow.path.split("?")[0].split("/").filter(Boolean)) {
+      let next = at.children.find((child) => child.name === name);
+      if (!next) at.children.push((next = node(name, `${at.path}/${name}`)));
+      at = next;
+      at.requests += 1;
+    }
+    at.flow_id = flow.id;
+    at.status = flow.status;
+  }
+  return [...roots.values()].sort((a, b) => a.target.host.localeCompare(b.target.host));
+}
+
+function mockFlows({ sort, ascending, offset = 0, site, before_id }: FlowFilter) {
+  const key = sort ?? "id";
+  const direction = sort && ascending ? 1 : -1;
+  const placed = flows.filter(
+    ({ host, path, id }) =>
+      (!site || (host === site.target.host && (!site.path || path === site.path || path.startsWith(`${site.path}/`) || path.startsWith(`${site.path}?`)))) &&
+      (before_id === undefined || id < before_id),
+  );
+  const sorted = placed.sort((a, b) => {
+    const [x, y] = [a[key] ?? 0, b[key] ?? 0];
+    return (typeof x === "string" ? x.localeCompare(y as string) : (x as number) - (y as number)) * direction || b.id - a.id;
+  });
+  return sorted.slice(offset);
+}
+
+function checkRule(rule: MatchRule): string | null {
+  if (rule.pattern === "") return "Enter the text to find.";
+  if (rule.kind.endsWith("_header") && /\s/.test(rule.pattern)) return `"${rule.pattern}" is not a valid header name.`;
+  try {
+    if (rule.regex) new RegExp(rule.pattern);
+  } catch {
+    return "Invalid regex: sample data could not compile this";
+  }
+  return null;
+}
+
+let mockRules: MatchRule[] = [
+  { enabled: true, direction: "request", kind: "set_header", pattern: "X-Sample", replacement: "1", regex: false },
+];
+const mockRulesView = () => ({ rules: mockRules, errors: mockRules.map(checkRule) });
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (command === "list_flows") return mockFlows(args?.filter as FlowFilter) as T;
+  if (command === "site_map") return mockSiteMap() as T;
+  if (command === "create_tab") return { id: Date.now(), name: args?.name, target: args?.target, request: args?.request } as T;
+  if (command === "get_match_rules") return mockRulesView() as T;
+  if (command === "set_match_rules") {
+    mockRules = args?.rules as MatchRule[];
+    return mockRulesView() as T;
+  }
+  if (command === "comparer_diff") return mockCompare(args?.a as RawText, args?.b as RawText) as T;
+  if (command === "decoder_run") return mockDecoder(args?.input as string, args?.steps as string[]) as T;
+  if (command === "decoder_smart") return ["url_decode", "base64_decode"] as T;
   if (command === "flow_detail") return detail(args?.id as number) as T;
   return (answers[command] ?? null) as T;
 }

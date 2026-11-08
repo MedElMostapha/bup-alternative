@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { call, toast } from "../api";
 import { RawEditor } from "../components/RawEditor";
+import { Split } from "../components/Split";
 import { clipForDisplay, formatBytes, statusClass } from "../format";
+import { useShortcuts } from "../shortcuts";
 import type { FlowDetail, FlowSummary, RepeaterTab, RequestDraft, Target } from "../types";
 
 const BLANK_REQUEST = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 const SAVE_DELAY = 400;
 
-export function Repeater({ draft, onDraftUsed }: { draft: RequestDraft | null; onDraftUsed: () => void }) {
+export function Repeater({ draft, onDraftUsed, active: shown }: { draft: RequestDraft | null; onDraftUsed: () => void; active: boolean }) {
   const [tabs, setTabs] = useState<RepeaterTab[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [results, setResults] = useState<Record<number, FlowDetail>>({});
@@ -94,6 +96,8 @@ export function Repeater({ draft, onDraftUsed }: { draft: RequestDraft | null; o
   const response = result?.decoded_response ?? result?.response;
   const busy = active ? sending[active.id] : false;
 
+  useShortcuts(shown, { enter: () => void (!busy && send()) });
+
   return (
     <div className="repeater">
       <div className="tab-strip" role="tablist">
@@ -121,7 +125,7 @@ export function Repeater({ draft, onDraftUsed }: { draft: RequestDraft | null; o
       {active ? (
         <>
           <div className="toolbar">
-            <button className="primary" disabled={busy} onClick={send}>
+            <button className="primary" disabled={busy} onClick={send} title="Ctrl+Enter">
               {busy ? "Sending…" : "Send"}
             </button>
             <button disabled={!busy} onClick={() => call("repeater_cancel", { tabId: active.id }).catch(toast)}>
@@ -164,7 +168,7 @@ export function Repeater({ draft, onDraftUsed }: { draft: RequestDraft | null; o
               ))}
             </select>
           </div>
-          <div className="panes">
+          <Split id="repeater" direction="row">
             <section className="pane">
               <header className="pane-head">
                 <h3>Request</h3>
@@ -193,7 +197,7 @@ export function Repeater({ draft, onDraftUsed }: { draft: RequestDraft | null; o
                 <p className="empty">Send the request to see the response.</p>
               )}
             </section>
-          </div>
+          </Split>
         </>
       ) : (
         <p className="empty">Use + to start a request, or send one here from Proxy history.</p>

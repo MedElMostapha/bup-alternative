@@ -2,10 +2,10 @@
 
 use std::io::Read;
 
-use super::head::Header;
+use super::head::{find_head_end, parse_response_head, Header};
 
 /// Limit on decoded output, so a compression bomb cannot exhaust memory.
-const MAX_DECODED: u64 = 64 * 1024 * 1024;
+pub const MAX_DECODED: u64 = 64 * 1024 * 1024;
 
 fn header_text<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
     headers
@@ -37,7 +37,7 @@ fn read_limited(reader: impl Read) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn inflate(body: &[u8], coding: &str) -> Option<Vec<u8>> {
+pub fn inflate(body: &[u8], coding: &str) -> Option<Vec<u8>> {
     match coding {
         "gzip" | "x-gzip" => read_limited(flate2::read::MultiGzDecoder::new(body)),
         "deflate" => read_limited(flate2::read::ZlibDecoder::new(body))
@@ -49,26 +49,40 @@ fn inflate(body: &[u8], coding: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Returns the readable form of a body, or the input if it cannot be decoded.
-pub fn decode_body(headers: &[Header], body: &[u8]) -> Vec<u8> {
+/// Removes transfer framing, leaving the body as is if it is not valid.
+pub fn unframe(headers: &[Header], body: &[u8]) -> Vec<u8> {
     let chunked = header_text(headers, "transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
-    let unframed = if chunked {
+    if chunked {
         dechunk(body).unwrap_or_else(|| body.to_vec())
     } else {
         body.to_vec()
-    };
-    let Some(codings) = header_text(headers, "content-encoding") else {
-        return unframed;
-    };
-    let mut current = unframed.clone();
-    // Codings are listed in the order they were applied.
-    for coding in codings.rsplit(',') {
-        match inflate(&current, coding.trim().to_ascii_lowercase().as_str()) {
-            Some(next) => current = next,
-            None => return unframed,
+    }
+}
+
+/// Undoes `Content-Encoding`, or returns `None` if the body cannot be decoded.
+pub fn decompress(headers: &[Header], unframed: &[u8]) -> Option<Vec<u8>> {
+    let mut current = unframed.to_vec();
+    if let Some(codings) = header_text(headers, "content-encoding") {
+        // Codings are listed in the order they were applied.
+        for coding in codings.rsplit(',') {
+            current = inflate(&current, coding.trim().to_ascii_lowercase().as_str())?;
         }
     }
-    current
+    Some(current)
+}
+
+/// Returns the readable form of a body, or the input if it cannot be decoded.
+pub fn decode_body(headers: &[Header], body: &[u8]) -> Vec<u8> {
+    let unframed = unframe(headers, body);
+    decompress(headers, &unframed).unwrap_or(unframed)
+}
+
+/// A whole response with its body made readable, or `None` if that changes nothing.
+pub fn decode_response(raw: &[u8]) -> Option<Vec<u8>> {
+    let head = parse_response_head(raw).ok()?;
+    let end = find_head_end(raw)?;
+    let decoded = decode_body(&head.headers, &raw[end..]);
+    (decoded != raw[end..]).then(|| [&raw[..end], decoded.as_slice()].concat())
 }
 
 #[cfg(test)]
@@ -108,6 +122,17 @@ mod tests {
         let mut br = Vec::new();
         brotli::CompressorWriter::new(&mut br, 4096, 5, 22).write_all(b"hello").unwrap();
         assert_eq!(decode_body(&[header("content-encoding", "br")], &br), b"hello");
+    }
+
+    #[test]
+    fn decodes_whole_responses_only_when_it_helps() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        raw.extend(gzip(b"hello"));
+        assert_eq!(
+            decode_response(&raw).unwrap(),
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nhello"
+        );
+        assert_eq!(decode_response(b"HTTP/1.1 200 OK\r\n\r\nhello"), None);
     }
 
     #[test]

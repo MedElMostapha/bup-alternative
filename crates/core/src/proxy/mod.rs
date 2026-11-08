@@ -21,6 +21,7 @@ use crate::http::{
     MessageReader, RequestHead, ResponseHead,
 };
 use crate::intercept::{Direction, Intercept, Pending, Verdict};
+use crate::match_replace::{RuleSet, Rewritten};
 use crate::model::{Flow, IdGen, Source, Target, WsFrame};
 use crate::scope::{glob_match, Scope};
 use crate::upstream::{connect, BoxIo, Connection};
@@ -59,6 +60,7 @@ pub struct ProxyCtx {
     pub scope: Arc<RwLock<Scope>>,
     pub intercept: Arc<Intercept>,
     pub settings: Arc<RwLock<ProxySettings>>,
+    pub rules: Arc<RwLock<RuleSet>>,
     pub ids: Arc<IdGen>,
     pub events: mpsc::Sender<Event>,
 }
@@ -70,6 +72,14 @@ impl ProxyCtx {
 
     fn body_cap(&self) -> usize {
         self.settings.read().expect("settings lock").body_cap
+    }
+
+    fn rewrite(&self, direction: Direction, message: &[u8], body_complete: bool) -> Option<Rewritten> {
+        self.rules.read().expect("rules lock").rewrite(direction, message, body_complete)
+    }
+
+    fn rewrites_bodies(&self, direction: Direction) -> bool {
+        self.rules.read().expect("rules lock").rewrites_bodies(direction)
     }
 
     fn is_passthrough(&self, host: &str) -> bool {
@@ -374,6 +384,14 @@ impl Session {
             .expect("scope lock")
             .allows(&target.host, &request_path(&head.target));
 
+        if in_scope {
+            if let Some(rewritten) = ctx.rewrite(Direction::Request, &request, body_complete) {
+                request = rewritten.message;
+                flow.request = request.clone();
+                flow.edited = true;
+            }
+        }
+
         if body_complete && in_scope {
             let verdict = await_verdict(ctx, client, flow.id, Direction::Request, &target, request.clone()).await;
             match verdict {
@@ -541,8 +559,9 @@ impl Session {
         let is_event_stream = head
             .header("content-type")
             .is_some_and(|v| v.to_ascii_lowercase().starts_with(b"text/event-stream"));
-        if in_scope && !is_event_stream && ctx.intercept.is_enabled(Direction::Response) {
-            let mut complete = false;
+        let must_buffer = ctx.intercept.is_enabled(Direction::Response) || ctx.rewrites_bodies(Direction::Response);
+        let mut complete = false;
+        if in_scope && !is_event_stream && must_buffer {
             while recorded.len() <= cap + head_len {
                 match up.conn.reader.next_body_chunk(&mut state).await {
                     Ok(Some(chunk)) => recorded.extend_from_slice(&chunk),
@@ -553,26 +572,36 @@ impl Session {
                     Err(e) => return self.bad_gateway(client, &mut flow, e).await,
                 }
             }
-            if complete {
-                let verdict =
-                    await_verdict(ctx, client, flow.id, Direction::Response, &target, recorded.clone()).await;
-                match verdict {
-                    None => return self.abandon(&mut flow, "client disconnected while intercepted").await,
-                    Some(Verdict::Drop) => {
-                        let body = simple_response("403 Forbidden", "Response dropped in Sluice");
-                        let _ = client.stream_mut().write_all(&body).await;
-                        flow.response = Some(recorded);
-                        return self.abandon(&mut flow, "dropped by user").await;
-                    }
-                    Some(Verdict::Edited(edited)) => {
-                        recorded = fix_content_length(&edited);
-                        flow.edited = true;
-                        // The edit may have changed the framing the client
-                        // would rely on, so end the connection after it.
-                        must_close = true;
-                    }
-                    Some(Verdict::Forward) => {}
+        }
+        if in_scope {
+            if let Some(rewritten) = ctx.rewrite(Direction::Response, &recorded, complete) {
+                recorded = rewritten.message;
+                flow.edited = true;
+                // A new body brings a matching length. A header rule that
+                // alters the framing leaves the client unable to reuse this.
+                let same_framing =
+                    parse_response_head(&recorded).is_ok_and(|new| response_framing(&new, method) == framing);
+                must_close |= !rewritten.body_changed && !same_framing;
+            }
+        }
+        if complete {
+            let verdict = await_verdict(ctx, client, flow.id, Direction::Response, &target, recorded.clone()).await;
+            match verdict {
+                None => return self.abandon(&mut flow, "client disconnected while intercepted").await,
+                Some(Verdict::Drop) => {
+                    let body = simple_response("403 Forbidden", "Response dropped in Sluice");
+                    let _ = client.stream_mut().write_all(&body).await;
+                    flow.response = Some(recorded);
+                    return self.abandon(&mut flow, "dropped by user").await;
                 }
+                Some(Verdict::Edited(edited)) => {
+                    recorded = fix_content_length(&edited);
+                    flow.edited = true;
+                    // The edit may have changed the framing the client
+                    // would rely on, so end the connection after it.
+                    must_close = true;
+                }
+                Some(Verdict::Forward) => {}
             }
         }
         client.stream_mut().write_all(&recorded).await?;

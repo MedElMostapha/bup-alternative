@@ -10,11 +10,13 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::fuzzer::{FuzzResult, FuzzRunInfo};
+use crate::http::decode::decode_response;
 use crate::http::{parse_request_head, parse_response_head};
 use crate::model::{Flow, Source, Target, WsFrame};
 use crate::repeater::RepeaterTab;
 use crate::scanner::Finding;
 use crate::scope::Scope;
+use crate::site_map::{SitePlace, SiteRow};
 
 const MAX_BATCH: usize = 500;
 
@@ -109,6 +111,36 @@ impl FlowSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    Id,
+    StartedMs,
+    Method,
+    Host,
+    Path,
+    Status,
+    ResponseLen,
+    DurationMs,
+    Mime,
+}
+
+impl SortColumn {
+    fn order_by(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::StartedMs => "started_ms",
+            Self::Method => "method COLLATE NOCASE",
+            Self::Host => "host COLLATE NOCASE",
+            Self::Path => "path COLLATE NOCASE",
+            Self::Status => "status",
+            Self::ResponseLen => "response_len",
+            Self::DurationMs => "duration_ms",
+            Self::Mime => "mime COLLATE NOCASE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FlowFilter {
@@ -122,6 +154,13 @@ pub struct FlowFilter {
     pub in_scope_only: bool,
     pub before_id: Option<u64>,
     pub limit: Option<u32>,
+    /// Newest first when unset.
+    pub sort: Option<SortColumn>,
+    pub ascending: bool,
+    /// How to page through a sorted list, where `before_id` means nothing.
+    pub offset: Option<u32>,
+    /// Only requests at or below this node of the site map.
+    pub site: Option<SitePlace>,
 }
 
 fn source_name(source: Source) -> &'static str {
@@ -256,6 +295,10 @@ impl Store {
             let path: String = ctx.get(1)?;
             Ok(scope.read().expect("scope lock").allows(&host, &path))
         })?;
+        reader.create_scalar_function("decoded_response", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+            let raw: Option<Vec<u8>> = ctx.get(0)?;
+            Ok(raw.and_then(|r| decode_response(&r)))
+        })?;
         let (writer, rx) = std_mpsc::channel();
         std::thread::spawn(move || writer_loop(write_conn, rx));
         Ok(Self {
@@ -328,25 +371,76 @@ impl Store {
             args.push(Value::Text(mime.clone()));
         }
         if let Some(text) = &filter.text {
-            clauses.push("(instr(request, ?) > 0 OR instr(COALESCE(response, x''), ?) > 0)".into());
+            clauses.push(
+                "(instr(request, ?) > 0 OR instr(COALESCE(response, x''), ?) > 0 \
+                 OR instr(decoded_response(response), ?) > 0)"
+                    .into(),
+            );
+            args.push(Value::Blob(text.clone().into_bytes()));
             args.push(Value::Blob(text.clone().into_bytes()));
             args.push(Value::Blob(text.clone().into_bytes()));
         }
         if filter.in_scope_only {
             clauses.push("in_scope(host, path)".into());
         }
+        if let Some(SitePlace { target, path }) = &filter.site {
+            clauses.push("host = ? AND port = ? AND tls = ?".into());
+            args.push(Value::Text(target.host.clone()));
+            args.push(Value::Integer(target.port as i64));
+            args.push(Value::Integer(target.tls as i64));
+            if !path.is_empty() {
+                // `/a` must not take in `/ab`, but does take in `/a/b` and `/a?x`.
+                let (folder, query) = (format!("{path}/"), format!("{path}?"));
+                clauses.push("(path = ? OR substr(path, 1, ?) = ? OR substr(path, 1, ?) = ?)".into());
+                args.push(Value::Text(path.clone()));
+                args.push(Value::Integer(folder.chars().count() as i64));
+                args.push(Value::Text(folder));
+                args.push(Value::Integer(query.chars().count() as i64));
+                args.push(Value::Text(query));
+            }
+        }
         if let Some(before) = filter.before_id {
             clauses.push("id < ?".into());
             args.push(Value::Integer(before as i64));
         }
         args.push(Value::Integer(filter.limit.unwrap_or(1000).min(10_000) as i64));
+        args.push(Value::Integer(filter.offset.unwrap_or(0) as i64));
+        let order = match filter.sort {
+            Some(column) => format!("{} {}, id DESC", column.order_by(), if filter.ascending { "ASC" } else { "DESC" }),
+            None => "id DESC".to_string(),
+        };
         let sql = format!(
-            "SELECT {SUMMARY_COLUMNS} FROM flows WHERE {} ORDER BY id DESC LIMIT ?",
+            "SELECT {SUMMARY_COLUMNS} FROM flows WHERE {} ORDER BY {order} LIMIT ? OFFSET ?",
             clauses.join(" AND ")
         );
         let conn = self.reader.lock().expect("reader lock");
         let mut statement = conn.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(args), summary_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Proxy traffic grouped for the site map, without reading any message.
+    pub fn site_rows(&self, in_scope_only: bool) -> Result<Vec<SiteRow>, StoreError> {
+        let scope = if in_scope_only { "AND in_scope(host, path)" } else { "" };
+        let sql = format!(
+            "SELECT host, port, tls, path, status, COUNT(*), MAX(id) FROM flows \
+             WHERE source = 'proxy' {scope} GROUP BY host, port, tls, path, status"
+        );
+        let conn = self.reader.lock().expect("reader lock");
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok(SiteRow {
+                target: Target {
+                    host: row.get(0)?,
+                    port: row.get(1)?,
+                    tls: row.get(2)?,
+                },
+                path: row.get(3)?,
+                status: row.get(4)?,
+                requests: row.get(5)?,
+                latest_id: row.get(6)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -560,6 +654,63 @@ mod tests {
     }
 
     #[test]
+    fn site_rows_group_proxy_traffic_only() {
+        let (_dir, store, scope) = open();
+        store.save_flow(flow(1, "a.test", "/x", 200));
+        store.save_flow(flow(2, "a.test", "/x", 200));
+        store.save_flow(flow(3, "a.test", "/x", 500));
+        store.save_flow(flow(4, "b.test", "/y", 200));
+        let mut sent = flow(5, "a.test", "/repeated", 200);
+        sent.source = Source::Repeater;
+        store.save_flow(sent);
+        store.flush();
+
+        let mut rows = store.site_rows(false).unwrap();
+        rows.sort_by_key(|row| row.latest_id);
+        let got: Vec<_> = rows.iter().map(|r| (r.target.host.as_str(), r.path.as_str(), r.status, r.requests, r.latest_id)).collect();
+        assert_eq!(
+            got,
+            [("a.test", "/x", Some(200), 2, 2), ("a.test", "/x", Some(500), 1, 3), ("b.test", "/y", Some(200), 1, 4)]
+        );
+
+        scope.write().unwrap().include.push(crate::scope::ScopeRule {
+            host: "b.test".into(),
+            path_prefix: String::new(),
+        });
+        let rows = store.site_rows(true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target.host, "b.test");
+    }
+
+    #[test]
+    fn a_site_place_takes_in_what_is_below_it_only() {
+        let (_dir, store, _) = open();
+        for (id, path) in [(1, "/a"), (2, "/a/"), (3, "/a/b"), (4, "/a?x=1"), (5, "/ab"), (6, "/")] {
+            store.save_flow(flow(id, "a.test", path, 200));
+        }
+        store.save_flow(flow(7, "b.test", "/a", 200));
+        store.flush();
+        let ids = |path: &str| -> Vec<u64> {
+            let site = SitePlace {
+                target: Target {
+                    host: "a.test".into(),
+                    port: 80,
+                    tls: false,
+                },
+                path: path.into(),
+            };
+            let filter = FlowFilter {
+                site: Some(site),
+                ..Default::default()
+            };
+            store.list_flows(&filter).unwrap().iter().map(|f| f.id).collect()
+        };
+        assert_eq!(ids("/a"), [4, 3, 2, 1]);
+        assert_eq!(ids("/a/b"), [3]);
+        assert_eq!(ids(""), [6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
     fn saving_again_updates_the_row() {
         let (_dir, store, _) = open();
         store.save_flow(flow(1, "a.test", "/", 200));
@@ -589,6 +740,55 @@ mod tests {
             path_prefix: String::new(),
         });
         assert_eq!(ids(FlowFilter { in_scope_only: true, ..Default::default() }), [2]);
+    }
+
+    #[test]
+    fn flows_sort_by_any_column_and_page_with_offset() {
+        let (_dir, store, _) = open();
+        store.save_flow(flow(1, "b.test", "/x", 404));
+        store.save_flow(flow(2, "A.test", "/z", 200));
+        store.save_flow(flow(3, "c.test", "/y", 500));
+        store.flush();
+        let ids = |sort: Option<SortColumn>, ascending: bool, offset: Option<u32>| -> Vec<u64> {
+            let filter = FlowFilter { sort, ascending, offset, limit: Some(2), ..Default::default() };
+            store.list_flows(&filter).unwrap().iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids(None, false, None), [3, 2]);
+        assert_eq!(ids(Some(SortColumn::Host), true, None), [2, 1], "text ignores case");
+        assert_eq!(ids(Some(SortColumn::Status), false, None), [3, 1]);
+        assert_eq!(ids(Some(SortColumn::Status), false, Some(2)), [2]);
+        assert_eq!(ids(Some(SortColumn::Path), true, Some(1)), [3, 2]);
+    }
+
+    #[test]
+    fn equal_sort_values_are_newest_first_and_sort_names_match_the_interface() {
+        let (_dir, store, _) = open();
+        store.save_flow(flow(1, "a.test", "/", 200));
+        store.save_flow(flow(2, "a.test", "/", 200));
+        store.flush();
+        let filter: FlowFilter = serde_json::from_str(r#"{"sort":"response_len","ascending":true}"#).unwrap();
+        assert_eq!(store.list_flows(&filter).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn text_search_reads_compressed_responses() {
+        use std::io::Write;
+        let (_dir, store, _) = open();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hidden needle").unwrap();
+        let mut compressed = flow(1, "a.test", "/", 200);
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        response.extend(encoder.finish().unwrap());
+        compressed.response = Some(response);
+        store.save_flow(compressed);
+        store.flush();
+        let found = |text: &str| {
+            let filter = FlowFilter { text: Some(text.into()), ..Default::default() };
+            store.list_flows(&filter).unwrap().len()
+        };
+        assert_eq!(found("hidden needle"), 1);
+        assert_eq!(found("Content-Encoding"), 1);
+        assert_eq!(found("absent"), 0);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { call, toast } from "../api";
 import { clipForDisplay, formatBytes, statusClass } from "../format";
-import type { FlowDetail, WsFrameView } from "../types";
+import type { FlowActions, FlowDetail, WsFrameView } from "../types";
 import { RawEditor } from "./RawEditor";
+import { Split } from "./Split";
 
 function FlowNotes({ detail }: { detail: FlowDetail }) {
   const { summary } = detail;
@@ -10,7 +11,7 @@ function FlowNotes({ detail }: { detail: FlowDetail }) {
     summary.error && `Error: ${summary.error}`,
     summary.tls_error && `Server certificate problem: ${summary.tls_error}`,
     summary.truncated && "Message was larger than the recording limit, so the stored copy is incomplete.",
-    summary.edited && "This message was edited before sending.",
+    summary.edited && "This message was changed before sending, by hand or by a Match & Replace rule.",
   ].filter(Boolean);
   if (notes.length === 0) return null;
   return (
@@ -40,8 +41,16 @@ function FrameList({ flowId, refresh }: { flowId: number; refresh: number }) {
   );
 }
 
+interface Props {
+  detail: FlowDetail;
+  flows: FlowActions;
+  /** How the right-click menu's Compare names this flow. */
+  label: string;
+  wsRefresh?: number;
+}
+
 /** Side-by-side read-only view of one request and its response. */
-export function FlowPanes({ detail, wsRefresh = 0 }: { detail: FlowDetail; wsRefresh?: number }) {
+export function FlowPanes({ detail, flows, label, wsRefresh = 0 }: Props) {
   const [decoded, setDecoded] = useState(true);
   const [showFrames, setShowFrames] = useState(false);
   const isUpgrade = detail.summary.status === 101;
@@ -50,9 +59,9 @@ export function FlowPanes({ detail, wsRefresh = 0 }: { detail: FlowDetail; wsRef
   useEffect(() => setShowFrames(isUpgrade), [detail.summary.id, isUpgrade]);
 
   return (
-    <div className="flow-panes">
+    <div className="flow-panes" onContextMenu={(event) => flows.menu(event, detail.summary.id, label, window.getSelection()?.toString())}>
       <FlowNotes detail={detail} />
-      <div className="panes">
+      <Split id="flow-panes" direction="row">
         <section className="pane">
           <header className="pane-head">
             <h3>Request</h3>
@@ -88,7 +97,7 @@ export function FlowPanes({ detail, wsRefresh = 0 }: { detail: FlowDetail; wsRef
             <p className="empty">No response recorded.</p>
           )}
         </section>
-      </div>
+      </Split>
     </div>
   );
 }
